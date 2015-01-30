@@ -4,7 +4,7 @@ all: ibpsolve
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $^
 
-ibpsolve: main.o
+ibpsolve: main.o hashtable.o
 	$(CC) -o $@ $^
 
 clean:
