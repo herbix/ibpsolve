@@ -1,7 +1,7 @@
 # ibpsolve
 An openwrt package used to solve I, B, P frames in a H.264 format video
 
-## Usage
+## Compile and Install
 Move to your openwrt packages directory:
 <pre>
 $ cd /path/to/openwrt/package/
