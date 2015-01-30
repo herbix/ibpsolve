@@ -2,10 +2,10 @@
 all: ibpsolve
 
 %.o: %.c
-    $(CC) $(CFLAGS) -c -o $@ $^
+	$(CC) $(CFLAGS) -c -o $@ $^
 
 ibpsolve: main.o
-    $(CC) -o $@ $^
+	$(CC) -o $@ $^
 
 clean:
-    rm -f *.o ibpsolve
+	rm -f *.o ibpsolve
