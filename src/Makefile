@@ -1,0 +1,11 @@
+
+all: ibpsolve
+
+%.o: %.c
+    $(CC) $(CFLAGS) -c -o $@ $^
+
+ibpsolve: main.o
+    $(CC) -o $@ $^
+
+clean:
+    rm -f *.o ibpsolve
