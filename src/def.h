@@ -12,7 +12,7 @@
 #define ASSERT(cond) if(cond){}
 #endif
 
-#define bool		int
+#define bool		char
 #define true		1
 #define false		0
 

@@ -1,4 +1,6 @@
 
+$(CFLAGS) += -O2 -Wall
+
 all: ibpsolve
 
 %.o: %.c
