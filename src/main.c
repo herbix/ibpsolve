@@ -289,12 +289,12 @@ static void parse_rtp_message(const struct ip_port_pair *pair,
 	struct nalhdr *nh;
 	const char *payload;
 	int payload_len;
-	int type;
+	int nal_type;
 	struct ip_port_pair *real_pair;
 	struct rtp_connect_data *data;
 	bool first_seg = true;
 	bool last_seg = true;
-	int rhseq;
+	u_int16_t rhseq;
 	int slice_type = -1;
 
 	if(!(rh->version == 2 && rh->payload_type == RTP_PAYLOAD_H264)) {
@@ -329,11 +329,12 @@ static void parse_rtp_message(const struct ip_port_pair *pair,
 
 	if(rhseq > data->current_seq || (rhseq - data->current_seq < 32768 && rhseq - data->current_seq > 0)) {
 		int n = rhseq - data->current_seq;
-		int seq = data->current_seq + 1;
+		u_int16_t seq = data->current_seq + 1;
 		data->packet_count += n;
 		while(n > 0) {
 			int pos = seq % RECIEVED_PACKAGE_COUNT;
 			int recieved_len = data->recieved_package_len[pos];
+			data->total_bytes += recieved_len;
 			data->packet_lost += (data->recieved_packages[pos] ? 0 : 1);
 			switch(data->recieved_package_type[pos] & 0xF) {
 				case SLICE_TYPE_I:
@@ -378,11 +379,11 @@ static void parse_rtp_message(const struct ip_port_pair *pair,
 	nh = (struct nalhdr*)(buffer + sizeof(struct rtphdr) + 4*rh->csrc_count);
 
 	payload = (char*)nh + 1;
-	type = nh->type;
+	nal_type = nh->type;
 	last_seg &= rh->mark;
 	if(nh->type == NAL_TYPE_FU_A) {
 		struct fuhdr *fh = (struct fuhdr*)payload;
-		type = fh->type;
+		nal_type = fh->type;
 		first_seg = fh->s;
 		last_seg &= fh->e;
 		payload++;
@@ -393,21 +394,19 @@ static void parse_rtp_message(const struct ip_port_pair *pair,
 		return;
 	}
 
-	data->total_bytes += payload_len;
-
 	if(first_seg) {
-		if(type == NAL_TYPE_SLICE) {
+		if(nal_type == NAL_TYPE_SLICE) {
 			const char *p = payload;
 			int offset = 0;
 			exp_golomb_decode(&p, &offset);
 			slice_type = exp_golomb_decode(&p, &offset) % 5;
-		} else if(type == NAL_TYPE_IDR) {
+		} else if(nal_type == NAL_TYPE_IDR) {
 			slice_type = SLICE_TYPE_I;
 		}
 
 		data->recieved_package_type[rhseq % RECIEVED_PACKAGE_COUNT] = slice_type;
 
-		int seq = rhseq + 1;
+		u_int16_t seq = rhseq + 1;
 		while(seq <= data->current_seq) {
 			int pos = seq % RECIEVED_PACKAGE_COUNT;
 			if(!(data->recieved_package_type[pos] & 0x10)) {
@@ -418,7 +417,7 @@ static void parse_rtp_message(const struct ip_port_pair *pair,
 		}
 	}
 
-	if(type == NAL_TYPE_SLICE || type == NAL_TYPE_IDR) {
+	if(nal_type == NAL_TYPE_SLICE || nal_type == NAL_TYPE_IDR) {
 		data->recieved_package_len[rhseq % RECIEVED_PACKAGE_COUNT] = payload_len;
 	} else {
 		data->other_bytes += payload_len;
@@ -563,7 +562,7 @@ static void parse_ip_datagram(const char *buffer, int len)
 static void parse_ether_frame(const char *buffer, int len)
 {
 	struct ethhdr *h = (struct ethhdr*)buffer;
-	short proto = ntohs(h->h_proto);
+	u_int16_t proto = ntohs(h->h_proto);
 	switch(proto) {
 		case ETH_P_IP:
 			parse_ip_datagram(buffer + sizeof(struct ethhdr), len - sizeof(struct ethhdr));
