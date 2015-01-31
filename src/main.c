@@ -44,10 +44,11 @@ struct rtp_connect_data {
 	u_int64_t p_frame_bytes;
 	u_int64_t b_frame_bytes;
 	u_int64_t other_bytes;
-	short current_frame_type;
 	u_int16_t current_seq;
 #define RECIEVED_PACKAGE_COUNT 32
 	bool recieved_packages[RECIEVED_PACKAGE_COUNT];
+	u_int8_t recieved_package_type[RECIEVED_PACKAGE_COUNT];
+	u_int16_t recieved_package_len[RECIEVED_PACKAGE_COUNT];
 	bool inited;
 };
 
@@ -140,11 +141,12 @@ static unsigned exp_golomb_decode(const char **buffer, int *offset)
 
 static int dump_ip_port_pair(const struct ip_port_pair *pair, print_func print, void *par1)
 {
-	const char *p = (const char*)&pair->srcport;
+	const unsigned char *p = (const unsigned char*)&pair->srcip;
+	const unsigned char *q = (const unsigned char*)&pair->dstip;
 	int r = 0;
-	r += print(par1, "%d.%d.%d.%d:%d -> ", p[0], p[1], p[2], p[3], pair->srcport);
-	p = (const char*)&pair->dstport;
-	r += print(par1, "%d.%d.%d.%d:%d", p[0], p[1], p[2], p[3], pair->dstport);
+	r += print(par1, "%d.%d.%d.%d:%d -> %d.%d.%d.%d:%d",
+				p[0], p[1], p[2], p[3], pair->srcport,
+				q[0], q[1], q[2], q[3], pair->dstport);
 	return r;
 }
 
@@ -161,10 +163,10 @@ static void parse_rtsp_request(const struct iphdr *iph, const struct tcphdr *tcp
 			len--;
 		}
 
-		if(!(n == 0 && i>=5 && strncmp(line, "SETUP", 5))) {
+		if(n == 0 && !(i >= 5 && 0 == strncmp(line, "SETUP", 5))) {
 			break;
 		}
-		if(i>=10 && strncmp(line, "Transport:", 10)) {
+		if(i >= 10 && 0 == strncmp(line, "Transport:", 10)) {
 			int index = indexof(line, i, "client_port=", 12);
 			if(index > 0) {
 				unsigned long dport = atoi(line+index+12);
@@ -222,7 +224,7 @@ static void parse_rtsp_response(const struct iphdr *iph, const struct tcphdr *tc
 			len--;
 		}
 
-		if(i>=10 && strncmp(line, "Transport:", 10)) {
+		if(i >= 10 && 0 == strncmp(line, "Transport:", 10)) {
 			int index = indexof(line, i, "server_port=", 12);
 			if(index > 0) {
 				unsigned long sport = atoi(line+index+12);
@@ -263,7 +265,7 @@ static void parse_rtsp_message(const struct iphdr *iph, const struct tcphdr *tcp
 		return;
 	}
 
-	if(tcph->dest == RTSP_PORT) {
+	if(ntohs(tcph->dest) == RTSP_PORT) {
 		parse_rtsp_request(iph, tcph, buffer, len);
 	} else {
 		parse_rtsp_response(iph, tcph, buffer, len);
@@ -292,10 +294,14 @@ static void parse_rtp_message(const struct ip_port_pair *pair,
 	struct rtp_connect_data *data;
 	bool first_seg = true;
 	bool last_seg = true;
+	int rhseq;
+	int slice_type = -1;
 
 	if(!(rh->version == 2 && rh->payload_type == RTP_PAYLOAD_H264)) {
 		return;
 	}
+
+	rhseq = ntohs(rh->seq);
 
 	real_pair = (struct ip_port_pair*)ht_get_key(sending_pairs, pair);
 	real_pair->timestamp = timestamp();
@@ -306,7 +312,7 @@ static void parse_rtp_message(const struct ip_port_pair *pair,
 		data->ssrc = rh->ssrc;
 		data->starttime = real_pair->timestamp;
 		data->packet_count = 0;
-		data->packet_lost = 0;
+		data->packet_lost = -RECIEVED_PACKAGE_COUNT;
 		data->i_frame_count = 0;
 		data->p_frame_count = 0;
 		data->b_frame_count = 0;
@@ -315,28 +321,58 @@ static void parse_rtp_message(const struct ip_port_pair *pair,
 		data->p_frame_bytes = 0;
 		data->b_frame_bytes = 0;
 		data->other_bytes = 0;
-		data->current_frame_type = -1;
-		data->current_seq = rh->seq - 1;
-		memset(data->recieved_packages, true, RECIEVED_PACKAGE_COUNT);
+		data->current_seq = rhseq - 1;
+		memset(data->recieved_packages, false, RECIEVED_PACKAGE_COUNT);
+		memset(data->recieved_package_type, 0xF, RECIEVED_PACKAGE_COUNT);
+		memset(data->recieved_package_len, 0, sizeof(u_int16_t) * RECIEVED_PACKAGE_COUNT);
 	}
 
-	if(rh->seq > data->current_seq || rh->seq - data->current_seq < 32768) {
-		int n = rh->seq - data->current_seq;
+	if(rhseq > data->current_seq || (rhseq - data->current_seq < 32768 && rhseq - data->current_seq > 0)) {
+		int n = rhseq - data->current_seq;
 		int seq = data->current_seq + 1;
 		data->packet_count += n;
 		while(n > 0) {
-			data->packet_lost += (data->recieved_packages[seq % RECIEVED_PACKAGE_COUNT] ? 0 : 1);
-			data->recieved_packages[seq % RECIEVED_PACKAGE_COUNT] = 0;
+			int pos = seq % RECIEVED_PACKAGE_COUNT;
+			int recieved_len = data->recieved_package_len[pos];
+			data->packet_lost += (data->recieved_packages[pos] ? 0 : 1);
+			switch(data->recieved_package_type[pos] & 0xF) {
+				case SLICE_TYPE_I:
+					data->i_frame_bytes += recieved_len;
+					if(!(data->recieved_package_type[pos] & 0x10))
+						data->i_frame_count++;
+					break;
+				case SLICE_TYPE_P:
+					data->p_frame_bytes += recieved_len;
+					if(!(data->recieved_package_type[pos] & 0x10))
+						data->p_frame_count++;
+					break;
+				case SLICE_TYPE_B:
+					data->b_frame_bytes += recieved_len;
+					if(!(data->recieved_package_type[pos] & 0x10))
+						data->b_frame_count++;
+					break;
+				default:
+					data->other_bytes += recieved_len;
+					break;
+			}
+			data->recieved_packages[pos] = 0;
+			if(data->recieved_package_type[(seq-1) % RECIEVED_PACKAGE_COUNT] & 0x20) {
+				data->recieved_package_type[pos] = 0xF;
+			} else {
+				data->recieved_package_type[pos] = 0x10 | data->recieved_package_type[(seq-1) % RECIEVED_PACKAGE_COUNT];
+			}
+			data->recieved_package_len[pos] = 0;
 			seq++;
 			n--;
 		}
 		seq--;
 		data->recieved_packages[seq % RECIEVED_PACKAGE_COUNT] = 1;
-		data->current_seq = rh->seq;
+		data->current_seq = rhseq;
+	} else if(!data->recieved_packages[rhseq % RECIEVED_PACKAGE_COUNT] &&
+			data->current_seq - rhseq < RECIEVED_PACKAGE_COUNT) {
+		data->recieved_packages[rhseq % RECIEVED_PACKAGE_COUNT] = 1;
 	} else {
-		if(data->current_seq - rh->seq < RECIEVED_PACKAGE_COUNT) {
-			data->recieved_packages[rh->seq % RECIEVED_PACKAGE_COUNT] = 1;
-		}
+		return;
 	}
 
 	nh = (struct nalhdr*)(buffer + sizeof(struct rtphdr) + 4*rh->csrc_count);
@@ -359,46 +395,37 @@ static void parse_rtp_message(const struct ip_port_pair *pair,
 
 	data->total_bytes += payload_len;
 
-	if(type == NAL_TYPE_SLICE) {
-		if(first_seg) {
+	if(first_seg) {
+		if(type == NAL_TYPE_SLICE) {
 			const char *p = payload;
 			int offset = 0;
-			int slice_type;
 			exp_golomb_decode(&p, &offset);
 			slice_type = exp_golomb_decode(&p, &offset) % 5;
-			data->current_frame_type = slice_type;
-			switch(slice_type) {
-				case SLICE_TYPE_I:
-					data->i_frame_count++;
-					break;
-				case SLICE_TYPE_P:
-					data->p_frame_count++;
-					break;
-				case SLICE_TYPE_B:
-					data->b_frame_count++;
-					break;
+		} else if(type == NAL_TYPE_IDR) {
+			slice_type = SLICE_TYPE_I;
+		}
+
+		data->recieved_package_type[rhseq % RECIEVED_PACKAGE_COUNT] = slice_type;
+
+		int seq = rhseq + 1;
+		while(seq <= data->current_seq) {
+			int pos = seq % RECIEVED_PACKAGE_COUNT;
+			if(!(data->recieved_package_type[pos] & 0x10)) {
+				break;
 			}
+			data->recieved_package_type[pos] = 0x10 | slice_type | (data->recieved_package_type[pos] & 0xE0);
+			seq++;
 		}
+	}
 
-		switch(data->current_frame_type) {
-			case SLICE_TYPE_I:
-				data->i_frame_bytes += payload_len;
-				break;
-			case SLICE_TYPE_P:
-				data->p_frame_bytes += payload_len;
-				break;
-			case SLICE_TYPE_B:
-				data->b_frame_bytes += payload_len;
-				break;
-			default:
-				data->other_bytes += payload_len;
-		}
-
-		if(last_seg) {
-			data->current_frame_type = -1;
-		}
+	if(type == NAL_TYPE_SLICE || type == NAL_TYPE_IDR) {
+		data->recieved_package_len[rhseq % RECIEVED_PACKAGE_COUNT] = payload_len;
 	} else {
 		data->other_bytes += payload_len;
+	}
+
+	if(last_seg) {
+		data->recieved_package_type[rhseq % RECIEVED_PACKAGE_COUNT] |= 0x20;
 	}
 }
 
@@ -421,17 +448,10 @@ static void output_data(FILE *f, struct rtp_connect_data *value)
 {
 	static char buffer[1024];
 	char *p;
-	int i;
+	u_int32_t pall = value->packet_count - RECIEVED_PACKAGE_COUNT;
 
 	if(!value->inited) {
 		return;
-	}
-
-	for(i=0; i<RECIEVED_PACKAGE_COUNT; i++) {
-		if(!value->recieved_packages[i]) {
-			value->packet_lost++;
-			value->recieved_packages[i] = true;
-		}
 	}
 
 	p = buffer;
@@ -439,17 +459,16 @@ static void output_data(FILE *f, struct rtp_connect_data *value)
 	p += dump_ip_port_pair(value->conn, (print_func)sprintf, p);
 	p += sprintf(p, "]\n");
 
-	p += sprintf(p, "\tDuring: %s ", ctime(&value->starttime));
+	p += sprintf(p, "    During: %s ", ctime(&value->starttime));
 	p += sprintf(p, "- %s\n", ctime(&value->conn->timestamp));
-	p += sprintf(p, "\tPackets: %d/%d ", value->packet_count - value->packet_lost, value->packet_count);
+	p += sprintf(p, "    Packets: %d/%d ", pall - value->packet_lost, pall);
 	p += sprintf(p, "Total Bytes: %" PRIu64 " bytes ", value->total_bytes);
-	p += sprintf(p, "Non-Frame Bytes: %" PRIu64 "bytes\n", value->other_bytes);
-	p += sprintf(p, "\tFrames: I:%d(%" PRIu64 " bytes) ", value->i_frame_count, value->i_frame_bytes);
+	p += sprintf(p, "Non-Frame Bytes: %" PRIu64 " bytes\n", value->other_bytes);
+	p += sprintf(p, "    Frames: I:%d(%" PRIu64 " bytes) ", value->i_frame_count, value->i_frame_bytes);
 	p += sprintf(p, "P:%d(%" PRIu64 " bytes) ", value->p_frame_count, value->p_frame_bytes);
 	p += sprintf(p, "B:%d(%" PRIu64 " bytes)\n\n", value->b_frame_count, value->b_frame_bytes);
 
 	if(verbose && f != stdout) {
-		printf("FINISH an rtp connection: \n");
 		fwrite(buffer, 1, p-buffer, stdout);
 	}
 	fwrite(buffer, 1, p-buffer, f);
@@ -466,6 +485,11 @@ static enum ht_traverse_action clean_iterator(void *key, void *value, void *data
 			if(f == NULL) {
 				perror("fopen");
 			} else {
+				if(verbose) {
+					printf("FINISH an rtp connection: [");
+					dump_ip_port_pair(pair, (print_func)fprintf, stdout);
+					printf("]\n");
+				}
 				output_data(f, (struct rtp_connect_data*)value);
 				fclose(f);
 			}

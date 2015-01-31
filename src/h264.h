@@ -2,6 +2,7 @@
 #define _H264_H_
 
 #define NAL_TYPE_SLICE	1
+#define NAL_TYPE_IDR	5
 #define NAL_TYPE_FU_A	28
 
 struct nalhdr {
