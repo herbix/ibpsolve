@@ -20,7 +20,7 @@
 #include "h264.h"
 
 #define BUFFER_SIZE 4096
-#define RTSP_PORT	8554
+#define RTSP_PORT	554
 
 struct ip_port_pair {
 	u_int32_t srcip;
@@ -64,7 +64,7 @@ struct rtp_connect_data {
 	bool inited;
 };
 
-static bool verbose = true;
+static bool verbose = false;
 
 static unsigned ip_port_pair_hashcode(const void *k)
 {
