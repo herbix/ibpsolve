@@ -20,7 +20,7 @@
 #include "h264.h"
 
 #define BUFFER_SIZE 4096
-#define RTSP_PORT	554
+#define RTSP_PORT	8554
 
 struct ip_port_pair {
 	u_int32_t srcip;
@@ -45,14 +45,26 @@ struct rtp_connect_data {
 	u_int64_t b_frame_bytes;
 	u_int64_t other_bytes;
 	u_int16_t current_seq;
-#define RECIEVED_PACKAGE_COUNT 32
-	bool recieved_packages[RECIEVED_PACKAGE_COUNT];
-	u_int8_t recieved_package_type[RECIEVED_PACKAGE_COUNT];
-	u_int16_t recieved_package_len[RECIEVED_PACKAGE_COUNT];
+#define RECIEVED_MESSAGE_COUNT	32
+	bool recieved_messages[RECIEVED_MESSAGE_COUNT];
+#define TYPE_SLICE_MASK			0xF
+#define TYPE_SLICE_UNKNOWN		0xF
+#define TYPE_FLAG_INHERT		0x10
+#define TYPE_FLAG_END			0x20
+	// recieved_message_type element format:
+	// 8 7 6 5 4 3 2 1 0
+	// +---+-+-+-------+
+	// |   |E|I|   T   |
+	// +---+-+-+-------+
+	// T: Slice type (P=0, B=1, I=2, UNKNOWN=3~15)
+	// I: The slice type of this message inherted from previous message
+	// E: This message is the end of a slice
+	u_int8_t recieved_message_type[RECIEVED_MESSAGE_COUNT];
+	u_int16_t recieved_message_len[RECIEVED_MESSAGE_COUNT];
 	bool inited;
 };
 
-static bool verbose = false;
+static bool verbose = true;
 
 static unsigned ip_port_pair_hashcode(const void *k)
 {
@@ -163,6 +175,11 @@ static void parse_rtsp_request(const struct iphdr *iph, const struct tcphdr *tcp
 			len--;
 		}
 
+		// According to RFC of RTSP, I know SETUP command contains
+		// ports used by RTP. Here is the request:
+		// SETUP rtsp://ip/uri RTSP/1.0
+		// CSeq: 3
+		// Transport: RTP/AVP;some params;client_port=32423;other params
 		if(n == 0 && !(i >= 5 && 0 == strncmp(line, "SETUP", 5))) {
 			break;
 		}
@@ -224,6 +241,12 @@ static void parse_rtsp_response(const struct iphdr *iph, const struct tcphdr *tc
 			len--;
 		}
 
+		// According to RFC of RTSP, I know SETUP command contains
+		// ports used by RTP. Here is the response:
+		// RTSP/1.0 200 OK
+		// CSeq: 3
+		// Transport: RTP/AVP;some params;client_port=32423;server_port=34543;other params
+		// Session: 12345678
 		if(i >= 10 && 0 == strncmp(line, "Transport:", 10)) {
 			int index = indexof(line, i, "server_port=", 12);
 			if(index > 0) {
@@ -281,105 +304,135 @@ static void parse_tcp_segment(const struct iphdr *iph, const char *buffer, int l
 	}
 }
 
+static void add_up_data_at_pos(struct rtp_connect_data *data, int pos)
+{
+	int recieved_len = data->recieved_message_len[pos];
+	data->total_bytes += recieved_len;
+	data->packet_lost += (data->recieved_messages[pos] ? 0 : 1);
+	switch(data->recieved_message_type[pos] & TYPE_SLICE_MASK) {
+		case SLICE_TYPE_I:
+			data->i_frame_bytes += recieved_len;
+			if(!(data->recieved_message_type[pos] & TYPE_FLAG_INHERT))
+				data->i_frame_count++;
+			break;
+		case SLICE_TYPE_P:
+			data->p_frame_bytes += recieved_len;
+			if(!(data->recieved_message_type[pos] & TYPE_FLAG_INHERT))
+				data->p_frame_count++;
+			break;
+		case SLICE_TYPE_B:
+			data->b_frame_bytes += recieved_len;
+			if(!(data->recieved_message_type[pos] & TYPE_FLAG_INHERT))
+				data->b_frame_count++;
+			break;
+		default:
+			data->other_bytes += recieved_len;
+			break;
+	}
+}
+
+static void init_rtp_data(struct rtp_connect_data *data, u_int32_t ssrc, time_t timestamp)
+{
+	data->inited = true;
+	data->ssrc = ssrc;
+	data->starttime = timestamp;
+	data->packet_count = 0;
+	data->packet_lost = -RECIEVED_MESSAGE_COUNT;
+	data->i_frame_count = 0;
+	data->p_frame_count = 0;
+	data->b_frame_count = 0;
+	data->total_bytes = 0;
+	data->i_frame_bytes = 0;
+	data->p_frame_bytes = 0;
+	data->b_frame_bytes = 0;
+	data->other_bytes = 0;
+	data->current_seq = 0;
+	memset(data->recieved_messages, false, RECIEVED_MESSAGE_COUNT);
+	memset(data->recieved_message_type, TYPE_SLICE_UNKNOWN, RECIEVED_MESSAGE_COUNT);
+	memset(data->recieved_message_len, 0, sizeof(u_int16_t) * RECIEVED_MESSAGE_COUNT);
+}
+
 static void parse_rtp_message(const struct ip_port_pair *pair,
 							const struct iphdr *iph, const struct udphdr *tcph,
 							const char *buffer, int len)
 {
 	struct rtphdr *rh = (struct rtphdr*)buffer;
-	struct nalhdr *nh;
-	const char *payload;
-	int payload_len;
-	int nal_type;
-	struct ip_port_pair *real_pair;
-	struct rtp_connect_data *data;
-	bool first_seg = true;
-	bool last_seg = true;
-	u_int16_t rhseq;
-	int slice_type = -1;
 
 	if(!(rh->version == 2 && rh->payload_type == RTP_PAYLOAD_H264)) {
 		return;
 	}
 
-	rhseq = ntohs(rh->seq);
+	struct ip_port_pair *real_pair = (struct ip_port_pair*)ht_get_key(sending_pairs, pair);
+	struct rtp_connect_data *data = (struct rtp_connect_data*)ht_get(sending_pairs, pair);
+	u_int16_t rhseq = ntohs(rh->seq);
 
-	real_pair = (struct ip_port_pair*)ht_get_key(sending_pairs, pair);
 	real_pair->timestamp = timestamp();
-	data = (struct rtp_connect_data*)ht_get(sending_pairs, pair);
 
 	if(!data->inited) {
-		data->inited = true;
-		data->ssrc = rh->ssrc;
-		data->starttime = real_pair->timestamp;
-		data->packet_count = 0;
-		data->packet_lost = -RECIEVED_PACKAGE_COUNT;
-		data->i_frame_count = 0;
-		data->p_frame_count = 0;
-		data->b_frame_count = 0;
-		data->total_bytes = 0;
-		data->i_frame_bytes = 0;
-		data->p_frame_bytes = 0;
-		data->b_frame_bytes = 0;
-		data->other_bytes = 0;
+		init_rtp_data(data, rh->ssrc, real_pair->timestamp);
 		data->current_seq = rhseq - 1;
-		memset(data->recieved_packages, false, RECIEVED_PACKAGE_COUNT);
-		memset(data->recieved_package_type, 0xF, RECIEVED_PACKAGE_COUNT);
-		memset(data->recieved_package_len, 0, sizeof(u_int16_t) * RECIEVED_PACKAGE_COUNT);
 	}
 
-	if(rhseq > data->current_seq || (rhseq - data->current_seq < 32768 && rhseq - data->current_seq > 0)) {
+	// Here are 3 cases of message recieving:
+	// 1. New message has larger seq no. than current maxium seq no.:
+	// +---------+---------+---------+---------+
+	// |    1    |    2    |    _    |    4    |
+	// +---------+---------+---------+---------+
+	// | Recieved| Recieved| Not Rcv |   New   |
+	// +---------+---------+---------+---------+
+	// 2. New message has less seq no. than current maxium seq no,
+	//    but no message with same seq no. recieved yet.
+	// +---------+---------+---------+---------+
+	// |    1    |    _    |    3    |    4    |
+	// +---------+---------+---------+---------+
+	// | Recieved| Not Rcv |   New   | Recieved|
+	// +---------+---------+---------+---------+
+	// 3. It's a duplicate message or very old message (with much less
+	// seq no. than current maxium seq no.).
+	if((u_int16_t)(rhseq - data->current_seq) < 32768 &&
+		(rhseq > data->current_seq || rhseq != data->current_seq)) {
 		int n = rhseq - data->current_seq;
 		u_int16_t seq = data->current_seq + 1;
 		data->packet_count += n;
+
+		// Replace old message cached, and add up its data before.
 		while(n > 0) {
-			int pos = seq % RECIEVED_PACKAGE_COUNT;
-			int recieved_len = data->recieved_package_len[pos];
-			data->total_bytes += recieved_len;
-			data->packet_lost += (data->recieved_packages[pos] ? 0 : 1);
-			switch(data->recieved_package_type[pos] & 0xF) {
-				case SLICE_TYPE_I:
-					data->i_frame_bytes += recieved_len;
-					if(!(data->recieved_package_type[pos] & 0x10))
-						data->i_frame_count++;
-					break;
-				case SLICE_TYPE_P:
-					data->p_frame_bytes += recieved_len;
-					if(!(data->recieved_package_type[pos] & 0x10))
-						data->p_frame_count++;
-					break;
-				case SLICE_TYPE_B:
-					data->b_frame_bytes += recieved_len;
-					if(!(data->recieved_package_type[pos] & 0x10))
-						data->b_frame_count++;
-					break;
-				default:
-					data->other_bytes += recieved_len;
-					break;
-			}
-			data->recieved_packages[pos] = 0;
-			if(data->recieved_package_type[(seq-1) % RECIEVED_PACKAGE_COUNT] & 0x20) {
-				data->recieved_package_type[pos] = 0xF;
+			int pos = seq % RECIEVED_MESSAGE_COUNT;
+			add_up_data_at_pos(data, pos);
+
+			// If E flag of last message type is set, this message type
+			// should be UNKNOWN without EI flags. Otherwise this message
+			// copies last message type and sets I flag.
+			if(data->recieved_message_type[(u_int16_t)(seq-1) % RECIEVED_MESSAGE_COUNT] & TYPE_FLAG_END) {
+				data->recieved_message_type[pos] = TYPE_SLICE_UNKNOWN;
 			} else {
-				data->recieved_package_type[pos] = 0x10 | data->recieved_package_type[(seq-1) % RECIEVED_PACKAGE_COUNT];
+				data->recieved_message_type[pos] = TYPE_FLAG_INHERT |
+					data->recieved_message_type[(u_int16_t)(seq-1) % RECIEVED_MESSAGE_COUNT];
 			}
-			data->recieved_package_len[pos] = 0;
+			data->recieved_messages[pos] = 0;
+			data->recieved_message_len[pos] = 0;
 			seq++;
 			n--;
 		}
+
 		seq--;
-		data->recieved_packages[seq % RECIEVED_PACKAGE_COUNT] = 1;
+		data->recieved_messages[seq % RECIEVED_MESSAGE_COUNT] = 1;
 		data->current_seq = rhseq;
-	} else if(!data->recieved_packages[rhseq % RECIEVED_PACKAGE_COUNT] &&
-			data->current_seq - rhseq < RECIEVED_PACKAGE_COUNT) {
-		data->recieved_packages[rhseq % RECIEVED_PACKAGE_COUNT] = 1;
+	} else if(!data->recieved_messages[rhseq % RECIEVED_MESSAGE_COUNT] &&
+			(u_int16_t)(data->current_seq - rhseq) < RECIEVED_MESSAGE_COUNT) {
+		data->recieved_messages[rhseq % RECIEVED_MESSAGE_COUNT] = 1;
 	} else {
 		return;
 	}
 
-	nh = (struct nalhdr*)(buffer + sizeof(struct rtphdr) + 4*rh->csrc_count);
+	struct nalhdr *nh = (struct nalhdr*)(buffer + sizeof(struct rtphdr) + 4*rh->csrc_count);
+	const char *payload = (char*)nh + 1;
+	int payload_len;
+	int nal_type = nh->type;
+	bool first_seg = true;
+	bool last_seg = true;
+	int slice_type = -1;
 
-	payload = (char*)nh + 1;
-	nal_type = nh->type;
 	last_seg &= rh->mark;
 	if(nh->type == NAL_TYPE_FU_A) {
 		struct fuhdr *fh = (struct fuhdr*)payload;
@@ -404,27 +457,35 @@ static void parse_rtp_message(const struct ip_port_pair *pair,
 			slice_type = SLICE_TYPE_I;
 		}
 
-		data->recieved_package_type[rhseq % RECIEVED_PACKAGE_COUNT] = slice_type;
+		data->recieved_message_type[rhseq % RECIEVED_MESSAGE_COUNT] = slice_type;
 
 		u_int16_t seq = rhseq + 1;
+
+		// Set type of messages after this message until reaching
+		// a message type with I flag cleared. E flag will be kept.
 		while(seq <= data->current_seq) {
-			int pos = seq % RECIEVED_PACKAGE_COUNT;
-			if(!(data->recieved_package_type[pos] & 0x10)) {
+			int pos = seq % RECIEVED_MESSAGE_COUNT;
+			if(!(data->recieved_message_type[pos] & TYPE_FLAG_INHERT)) {
 				break;
 			}
-			data->recieved_package_type[pos] = 0x10 | slice_type | (data->recieved_package_type[pos] & 0xE0);
+			data->recieved_message_type[pos] = TYPE_FLAG_INHERT |
+				slice_type | (data->recieved_message_type[pos] & 0xE0);
 			seq++;
 		}
 	}
 
+	// If this message doesn't contain a frame message, I count it
+	// immediately instead of caching it.
 	if(nal_type == NAL_TYPE_SLICE || nal_type == NAL_TYPE_IDR) {
-		data->recieved_package_len[rhseq % RECIEVED_PACKAGE_COUNT] = payload_len;
+		data->recieved_message_len[rhseq % RECIEVED_MESSAGE_COUNT] = payload_len;
 	} else {
 		data->other_bytes += payload_len;
+		data->total_bytes += payload_len;
 	}
 
+	// Set E flag when this message is the last segment of a slice.
 	if(last_seg) {
-		data->recieved_package_type[rhseq % RECIEVED_PACKAGE_COUNT] |= 0x20;
+		data->recieved_message_type[rhseq % RECIEVED_MESSAGE_COUNT] |= TYPE_FLAG_END;
 	}
 }
 
@@ -447,7 +508,7 @@ static void output_data(FILE *f, struct rtp_connect_data *value)
 {
 	static char buffer[1024];
 	char *p;
-	u_int32_t pall = value->packet_count - RECIEVED_PACKAGE_COUNT;
+	u_int32_t pall = value->packet_count - RECIEVED_MESSAGE_COUNT;
 
 	if(!value->inited) {
 		return;
@@ -460,6 +521,7 @@ static void output_data(FILE *f, struct rtp_connect_data *value)
 
 	p += sprintf(p, "    During: %s ", ctime(&value->starttime));
 	p += sprintf(p, "- %s\n", ctime(&value->conn->timestamp));
+	p += sprintf(p, "    Current Sequence Number: %d\n", value->current_seq);
 	p += sprintf(p, "    Packets: %d/%d ", pall - value->packet_lost, pall);
 	p += sprintf(p, "Total Bytes: %" PRIu64 " bytes ", value->total_bytes);
 	p += sprintf(p, "Non-Frame Bytes: %" PRIu64 " bytes\n", value->other_bytes);
@@ -477,19 +539,34 @@ static enum ht_traverse_action clean_iterator(void *key, void *value, void *data
 {
 	struct {time_t current; struct hashtable *ht;} *data = dataptr;
 	struct ip_port_pair *pair = (struct ip_port_pair*)key;
+
+	// If I haven't recieved data from a connection for 60
+	// seconds, I consider it's closed.
 	if(data->current - pair->timestamp > 60) {
 		if(data->ht == sending_pairs) {
-			FILE *f;
-			f = fopen("history.txt", "a");
+			FILE *f = fopen("history.txt", "a");
+
 			if(f == NULL) {
 				perror("fopen");
 			} else {
+				struct rtp_connect_data *rtpdata = (struct rtp_connect_data*)value;
+
 				if(verbose) {
 					printf("FINISH an rtp connection: [");
 					dump_ip_port_pair(pair, (print_func)fprintf, stdout);
 					printf("]\n");
 				}
-				output_data(f, (struct rtp_connect_data*)value);
+
+				if(rtpdata->inited) {
+					int i;
+					// The packets cached in the buffer should be counted here.
+					for(i=0; i<RECIEVED_MESSAGE_COUNT; i++) {
+						add_up_data_at_pos(rtpdata, i);
+					}
+					rtpdata->packet_count += RECIEVED_MESSAGE_COUNT;
+					output_data(f, rtpdata);
+				}
+
 				fclose(f);
 			}
 			free(value);
@@ -534,6 +611,8 @@ static void parse_ip_datagram(const char *buffer, int len)
 	struct iphdr *h = (struct iphdr*)buffer;
 	int hl = h->ihl * 4;
 
+	// I assume that the network layer doesn't split transport
+	// layer segments.
 	switch(h->protocol) {
 		case IPPROTO_TCP:
 			parse_tcp_segment(h, buffer+hl, len-hl);
@@ -545,6 +624,8 @@ static void parse_ip_datagram(const char *buffer, int len)
 			break;
 	}
 
+	// Each time 1000 datagrams is recieved, I remove closed
+	// connections and save running data of connections.
 	static time_t last_clean_time = 0;
 	static int counter = 0;
 	counter++;
@@ -562,20 +643,13 @@ static void parse_ip_datagram(const char *buffer, int len)
 static void parse_ether_frame(const char *buffer, int len)
 {
 	struct ethhdr *h = (struct ethhdr*)buffer;
-	u_int16_t proto = ntohs(h->h_proto);
-	switch(proto) {
-		case ETH_P_IP:
-			parse_ip_datagram(buffer + sizeof(struct ethhdr), len - sizeof(struct ethhdr));
-			break;
-		default:
-			break;
+	if(ntohs(h->h_proto) == ETH_P_IP) {
+		parse_ip_datagram(buffer + sizeof(struct ethhdr), len - sizeof(struct ethhdr));
 	}
 }
 
 int main(int argc, char **argv)
 {
-	static char buffer[BUFFER_SIZE];
-	int s;
 	int opt;
 
 	while(-1 != (opt = getopt(argc, argv, "v"))) {
@@ -588,6 +662,9 @@ int main(int argc, char **argv)
 				return -1;
 		}
 	}
+
+	static char buffer[BUFFER_SIZE];
+	int s;
 
 	s = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
 
