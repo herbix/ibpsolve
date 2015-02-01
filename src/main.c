@@ -518,8 +518,15 @@ static void output_data(FILE *f, struct rtp_connect_data *value)
 	p += dump_ip_port_pair(value->conn, (print_func)sprintf, p);
 	p += sprintf(p, "]\n");
 
-	p += sprintf(p, "    During: %s ", ctime(&value->starttime));
-	p += sprintf(p, "- %s\n", ctime(&value->conn->timestamp));
+	{
+		char *s = ctime(&value->starttime);
+		s[strlen(s)-1] = 0;
+		p += sprintf(p, "    During: %s ", s);
+		s = ctime(&value->conn->timestamp);
+		s[strlen(s)-1] = 0;
+		p += sprintf(p, "- %s\n", s);
+	}
+
 	p += sprintf(p, "    Current Sequence Number: %d\n", value->current_seq);
 	p += sprintf(p, "    Packets: %d/%d ", pall - value->packet_lost, pall);
 	p += sprintf(p, "Total Bytes: %" PRIu64 " bytes ", value->total_bytes);
