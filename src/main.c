@@ -389,9 +389,8 @@ static void parse_rtp_message(const struct ip_port_pair *pair,
 	// +---------+---------+---------+---------+
 	// 3. It's a duplicate message or very old message (with much less
 	// seq no. than current maxium seq no.).
-	if((u_int16_t)(rhseq - data->current_seq) < 32768 &&
-		(rhseq > data->current_seq || rhseq != data->current_seq)) {
-		int n = rhseq - data->current_seq;
+	if((u_int16_t)(rhseq - data->current_seq) < 32768 && rhseq != data->current_seq) {
+		int n = (u_int16_t)(rhseq - data->current_seq);
 		u_int16_t seq = data->current_seq + 1;
 		data->packet_count += n;
 
