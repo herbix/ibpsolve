@@ -20,7 +20,7 @@
 #include "h264.h"
 
 #define BUFFER_SIZE 4096
-#define RTSP_PORT	554
+#define RTSP_PORT	rtsp_port
 
 struct ip_port_pair {
 	u_int32_t srcip;
@@ -65,6 +65,7 @@ struct rtp_connect_data {
 };
 
 static bool verbose = false;
+static u_int16_t rtsp_port = 554;
 
 static unsigned ip_port_pair_hashcode(const void *k)
 {
@@ -353,7 +354,7 @@ static void init_rtp_data(struct rtp_connect_data *data, u_int32_t ssrc, time_t 
 }
 
 static void parse_rtp_message(const struct ip_port_pair *pair,
-							const struct iphdr *iph, const struct udphdr *tcph,
+							const struct iphdr *iph, const struct udphdr *udph,
 							const char *buffer, int len)
 {
 	struct rtphdr *rh = (struct rtphdr*)buffer;
@@ -612,7 +613,7 @@ static void save_current_data()
 	fclose(f);
 }
 
-static void parse_ip_datagram(const char *buffer, int len)
+static int parse_ip_datagram(const char *buffer, int len)
 {
 	struct iphdr *h = (struct iphdr*)buffer;
 	int hl = h->ihl * 4;
@@ -644,27 +645,34 @@ static void parse_ip_datagram(const char *buffer, int len)
 		}
 		counter = 0;
 	}
+
+	return ntohs(h->tot_len);
 }
 
-static void parse_ether_frame(const char *buffer, int len)
+static int parse_ether_frame(const char *buffer, int len)
 {
 	struct ethhdr *h = (struct ethhdr*)buffer;
 	if(ntohs(h->h_proto) == ETH_P_IP) {
-		parse_ip_datagram(buffer + sizeof(struct ethhdr), len - sizeof(struct ethhdr));
+		return sizeof(struct ethhdr) +
+			parse_ip_datagram(buffer + sizeof(struct ethhdr), len - sizeof(struct ethhdr));
 	}
+	return len;
 }
 
 int main(int argc, char **argv)
 {
 	int opt;
 
-	while(-1 != (opt = getopt(argc, argv, "v"))) {
+	while(-1 != (opt = getopt(argc, argv, "vp:"))) {
 		switch(opt) {
 			case 'v':
 				verbose = true;
 				break;
+			case 'p':
+				rtsp_port = atoi(optarg);
+				break;
 			case '?':
-				printf("Usage: %s [-v]\n", argv[0]);
+				printf("Usage: %s [-v] [-p <port>]\n", argv[0]);
 				return -1;
 		}
 	}
@@ -686,9 +694,14 @@ int main(int argc, char **argv)
 
 	while(true) {
 		int len = read(s, buffer, BUFFER_SIZE);
+		char *p = buffer;
 		ASSERT(len < BUFFER_SIZE);
 
-		parse_ether_frame(buffer, len);
+		while(len > 0) {
+			int n = parse_ether_frame(p, len);
+			p += n;
+			len -= n;
+		}
 	}
 
 	close(s);
