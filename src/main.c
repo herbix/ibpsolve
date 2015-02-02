@@ -66,8 +66,8 @@ struct rtp_connect_data {
 	bool inited;
 };
 
-static bool verbose = true;
-static u_int16_t rtsp_port = 8554;
+static bool verbose = false;
+static u_int16_t rtsp_port = 554;
 
 static unsigned ip_port_pair_hashcode(const void *k)
 {
