@@ -8,6 +8,8 @@
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
 
+#include <pcap.h>
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -64,8 +66,8 @@ struct rtp_connect_data {
 	bool inited;
 };
 
-static bool verbose = false;
-static u_int16_t rtsp_port = 554;
+static bool verbose = true;
+static u_int16_t rtsp_port = 8554;
 
 static unsigned ip_port_pair_hashcode(const void *k)
 {
@@ -82,25 +84,6 @@ struct hashtable *preparing_pairs;
 struct hashtable *sending_pairs;
 
 typedef int (*print_func)(void*, char*, ...);
-
-static void set_promisc(int sock_raw_fd)
-{
-	char *eth_name = "eth0";
-	struct ifreq ethreq;
-	strncpy(ethreq.ifr_name, eth_name, IFNAMSIZ);
-	if(-1 == ioctl(sock_raw_fd, SIOCGIFFLAGS, &ethreq)) {
-		perror("ioctl");
-		close(sock_raw_fd);
-		exit(-1);
-	}
-
-	ethreq.ifr_flags |= IFF_PROMISC;
-	if(-1 == ioctl(sock_raw_fd, SIOCSIFFLAGS, &ethreq)) {
-		perror("ioctl");
-		close(sock_raw_fd);
-		exit(-1);
-	}
-}
 
 static int indexof(const char *str, int len1, const char *substr, int len2)
 {
@@ -652,6 +635,7 @@ static int parse_ip_datagram(const char *buffer, int len)
 static int parse_ether_frame(const char *buffer, int len)
 {
 	struct ethhdr *h = (struct ethhdr*)buffer;
+
 	if(ntohs(h->h_proto) == ETH_P_IP) {
 		return sizeof(struct ethhdr) +
 			parse_ip_datagram(buffer + sizeof(struct ethhdr), len - sizeof(struct ethhdr));
@@ -659,11 +643,22 @@ static int parse_ether_frame(const char *buffer, int len)
 	return len;
 }
 
+static int parse_linux_sll_frame(const char *buffer, int len)
+{
+	u_int16_t proto = ntohs(*(u_int16_t*)(buffer+14));
+	if(proto == ETH_P_IP) {
+		return 16 +
+			parse_ip_datagram(buffer + 16, len - 16);
+	}
+	return len;
+}
+
 int main(int argc, char **argv)
 {
+	static char device[10] = "any";
 	int opt;
 
-	while(-1 != (opt = getopt(argc, argv, "vp:"))) {
+	while(-1 != (opt = getopt(argc, argv, "vp:d:"))) {
 		switch(opt) {
 			case 'v':
 				verbose = true;
@@ -671,40 +666,49 @@ int main(int argc, char **argv)
 			case 'p':
 				rtsp_port = atoi(optarg);
 				break;
+			case 'd':
+				strncpy(device, optarg, 9);
+				break;
 			case '?':
-				printf("Usage: %s [-v] [-p <port>]\n", argv[0]);
+				printf("Usage: %s [-v] [-p <port>] <-d device>\n", argv[0]);
 				return -1;
 		}
 	}
 
 	static char buffer[BUFFER_SIZE];
-	int s;
+	pcap_t *pcap;
+	int linktype;
+	int (*link_frame_parser)(const char *, int);
 
-	s = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+	pcap = pcap_open_live(device, BUFFER_SIZE, true, 10000, buffer);
 
-	if(-1 == s) {
-		perror("socket");
+	if(pcap == NULL) {
+		fprintf(stderr, "pcap_open_live: %s\n", buffer);
 		exit(-1);
 	}
 
-	set_promisc(s);
+	linktype = pcap_datalink(pcap);
+	if(linktype != DLT_EN10MB && linktype != DLT_LINUX_SLL) {
+		fprintf(stderr, "Unsupport data link type: %d\n", linktype);
+		exit(-1);
+	}
+	link_frame_parser = linktype == DLT_EN10MB ? parse_ether_frame : parse_linux_sll_frame;
 
 	preparing_pairs = ht_init(128, ip_port_pair_hashcode, ip_port_pair_equal);
 	sending_pairs = ht_init(128, ip_port_pair_hashcode, ip_port_pair_equal);
 
 	while(true) {
-		int len = read(s, buffer, BUFFER_SIZE);
-		char *p = buffer;
-		ASSERT(len < BUFFER_SIZE);
+		struct pcap_pkthdr pcaphdr;
+		const u_char *c = pcap_next(pcap, &pcaphdr);
+		const char *p = (const char*)c;
 
-		while(len > 0) {
-			int n = parse_ether_frame(p, len);
-			p += n;
-			len -= n;
+		if(p != NULL) {
+			int len = pcaphdr.len;
+			link_frame_parser(p, len);
 		}
 	}
 
-	close(s);
+	pcap_close(pcap);
 
 	return 0;
 }

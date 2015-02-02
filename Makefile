@@ -2,7 +2,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=ibpsolve
-PKG_VERSION:=0.4.4
+PKG_VERSION:=0.5.0
 PKG_RELEASE:=1
 
 include $(INCLUDE_DIR)/package.mk
@@ -10,6 +10,7 @@ include $(INCLUDE_DIR)/package.mk
 define Package/ibpsolve
 	SECTION:=utils
 	CATEGORY:=Utilities
+	DEPENDS:=+libpcap
 	TITLE:=ibpsolve -- find out how many i, b, p frames are in a h.264 video
 endef
 

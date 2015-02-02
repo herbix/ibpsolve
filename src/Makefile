@@ -7,7 +7,7 @@ all: ibpsolve
 	$(CC) $(CFLAGS) -c -o $@ $^
 
 ibpsolve: main.o hashtable.o
-	$(CC) -o $@ $^
+	$(CC) -lpcap -o $@ $^
 
 clean:
 	rm -f *.o ibpsolve
