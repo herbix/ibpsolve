@@ -20,9 +20,14 @@
 #include "hashtable.h"
 #include "rtp.h"
 #include "h264.h"
+#include "batman.h"
 
 #define BUFFER_SIZE 4096
 #define RTSP_PORT	rtsp_port
+
+#ifndef ETH_P_BATMAN
+#define ETH_P_BATMAN	0x4305
+#endif
 
 struct ip_port_pair {
 	u_int32_t srcip;
@@ -632,25 +637,56 @@ static int parse_ip_datagram(const char *buffer, int len)
 	return ntohs(h->tot_len);
 }
 
+static int parse_ether_frame(const char *buffer, int len);
+
+static int parse_batman_frame(const char *buffer, int len)
+{
+	struct batadv_ogm_packet *h = (struct batadv_ogm_packet*)buffer;
+	if(h->version == BATADV_COMPAT_VERSION) {
+		int headlen;
+		switch(h->packet_type) {
+			case BATADV_BCAST:
+				headlen = sizeof(struct batadv_bcast_packet);
+				break;
+			case BATADV_UNICAST:
+				headlen = sizeof(struct batadv_unicast_packet);
+				break;
+			case BATADV_UNICAST_4ADDR:
+				headlen = sizeof(struct batadv_unicast_4addr_packet);
+				break;
+			default:
+				headlen = len;
+				break;
+		}
+		if(headlen < len) {
+			return headlen +
+				parse_ether_frame(buffer+headlen, len-headlen);
+		}
+	}
+	return len;
+}
+
+static int parse_eth_proto(u_int16_t proto, const char *buffer, int len)
+{
+	if(proto == ETH_P_IP) {
+		return parse_ip_datagram(buffer, len);
+	} else if(proto == ETH_P_BATMAN) {
+		return parse_batman_frame(buffer, len);
+	}
+	return len;
+}
+
 static int parse_ether_frame(const char *buffer, int len)
 {
 	struct ethhdr *h = (struct ethhdr*)buffer;
-
-	if(ntohs(h->h_proto) == ETH_P_IP) {
-		return sizeof(struct ethhdr) +
-			parse_ip_datagram(buffer + sizeof(struct ethhdr), len - sizeof(struct ethhdr));
-	}
-	return len;
+	return sizeof(struct ethhdr) + parse_eth_proto(ntohs(h->h_proto),
+			buffer + sizeof(struct ethhdr), len - sizeof(struct ethhdr));
 }
 
 static int parse_linux_sll_frame(const char *buffer, int len)
 {
 	u_int16_t proto = ntohs(*(u_int16_t*)(buffer+14));
-	if(proto == ETH_P_IP) {
-		return 16 +
-			parse_ip_datagram(buffer + 16, len - 16);
-	}
-	return len;
+	return 16 + parse_eth_proto(proto, buffer + 16, len - 16);
 }
 
 int main(int argc, char **argv)
