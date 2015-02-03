@@ -1,4 +1,3 @@
-#include <unistd.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <net/if.h>
@@ -8,13 +7,16 @@
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
 
-#include <pcap.h>
-
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 #include <time.h>
 #include <inttypes.h>
+#include <signal.h>
+#include <setjmp.h>
+
+#include <pcap.h>
 
 #include "def.h"
 #include "hashtable.h"
@@ -532,12 +534,12 @@ static void output_data(FILE *f, struct rtp_connect_data *value)
 
 static enum ht_traverse_action clean_iterator(void *key, void *value, void *dataptr)
 {
-	struct {time_t current; struct hashtable *ht;} *data = dataptr;
+	struct {time_t current; struct hashtable *ht; bool force;} *data = dataptr;
 	struct ip_port_pair *pair = (struct ip_port_pair*)key;
 
 	// If I haven't recieved data from a connection for 60
 	// seconds, I consider it's closed.
-	if(data->current - pair->timestamp > 60) {
+	if(data->current - pair->timestamp > 60 || data->force) {
 		if(data->ht == sending_pairs) {
 			FILE *f = fopen("history.txt", "a");
 
@@ -572,11 +574,12 @@ static enum ht_traverse_action clean_iterator(void *key, void *value, void *data
 	return NO_ACTION;
 }
 
-static void clean_hashtables(time_t current)
+static void clean_hashtables(time_t current, bool force)
 {
-	struct {time_t current; struct hashtable *ht;} data;
+	struct {time_t current; struct hashtable *ht; bool force;} data;
 
 	data.current = current;
+	data.force = force;
 	data.ht = preparing_pairs;
 	ht_traverse(preparing_pairs, clean_iterator, &data);
 
@@ -627,7 +630,7 @@ static int parse_ip_datagram(const char *buffer, int len)
 	if(counter == 1000) {
 		time_t current = timestamp();
 		if(current - last_clean_time > 60) {
-			clean_hashtables(current);
+			clean_hashtables(current, false);
 			save_current_data();
 			last_clean_time = current;
 		}
@@ -689,6 +692,13 @@ static int parse_linux_sll_frame(const char *buffer, int len)
 	return 16 + parse_eth_proto(proto, buffer + 16, len - 16);
 }
 
+static jmp_buf jmp_buffer;
+
+static void shutdown_handler(int sig)
+{
+	longjmp(jmp_buffer, 1);
+}
+
 int main(int argc, char **argv)
 {
 	static char device[10] = "any";
@@ -733,16 +743,28 @@ int main(int argc, char **argv)
 	preparing_pairs = ht_init(128, ip_port_pair_hashcode, ip_port_pair_equal);
 	sending_pairs = ht_init(128, ip_port_pair_hashcode, ip_port_pair_equal);
 
-	while(true) {
-		struct pcap_pkthdr pcaphdr;
-		const u_char *c = pcap_next(pcap, &pcaphdr);
-		const char *p = (const char*)c;
+	signal(SIGTERM, shutdown_handler);
+	signal(SIGINT, shutdown_handler);
+	signal(SIGQUIT, shutdown_handler);
 
-		if(p != NULL) {
-			int len = pcaphdr.len;
-			link_frame_parser(p, len);
+	int r = setjmp(jmp_buffer);
+
+	if(r == 0) {
+		while(true) {
+			struct pcap_pkthdr pcaphdr;
+			const u_char *c = pcap_next(pcap, &pcaphdr);
+			const char *p = (const char*)c;
+
+			if(p != NULL) {
+				int len = pcaphdr.len;
+				link_frame_parser(p, len);
+			}
 		}
 	}
+
+	clean_hashtables(0, true);
+	ht_destroy(preparing_pairs);
+	ht_destroy(sending_pairs);
 
 	pcap_close(pcap);
 

@@ -2,7 +2,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=ibpsolve
-PKG_VERSION:=0.5.1
+PKG_VERSION:=0.5.3
 PKG_RELEASE:=1
 
 include $(INCLUDE_DIR)/package.mk
