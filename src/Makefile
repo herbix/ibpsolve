@@ -1,5 +1,5 @@
 
-$(CFLAGS) += -O2 -Wall
+CFLAGS+=-O2 -Wall
 
 all: ibpsolve
 
