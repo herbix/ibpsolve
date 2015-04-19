@@ -48,6 +48,12 @@ struct rtp_connect_data {
 	u_int32_t i_frame_count;
 	u_int32_t p_frame_count;
 	u_int32_t b_frame_count;
+	u_int32_t i_frame_packet_count;
+	u_int32_t b_frame_packet_count;
+	u_int32_t p_frame_packet_count;
+	u_int32_t i_frame_packet_lost;
+	u_int32_t b_frame_packet_lost;
+	u_int32_t p_frame_packet_lost;
 	u_int64_t total_bytes;
 	u_int64_t i_frame_bytes;
 	u_int64_t p_frame_bytes;
@@ -303,16 +309,28 @@ static void add_up_data_at_pos(struct rtp_connect_data *data, int pos)
 	switch(data->recieved_message_type[pos] & TYPE_SLICE_MASK) {
 		case SLICE_TYPE_I:
 			data->i_frame_bytes += recieved_len;
+			data->i_frame_packet_count++;
+			if(!data->recieved_messages[pos]) {
+				data->i_frame_packet_lost++;
+			}
 			if(!(data->recieved_message_type[pos] & TYPE_FLAG_INHERT))
 				data->i_frame_count++;
 			break;
 		case SLICE_TYPE_P:
 			data->p_frame_bytes += recieved_len;
+			data->p_frame_packet_count++;
+			if(!data->recieved_messages[pos]) {
+				data->p_frame_packet_lost++;
+			}
 			if(!(data->recieved_message_type[pos] & TYPE_FLAG_INHERT))
 				data->p_frame_count++;
 			break;
 		case SLICE_TYPE_B:
 			data->b_frame_bytes += recieved_len;
+			data->b_frame_packet_count++;
+			if(!data->recieved_messages[pos]) {
+				data->b_frame_packet_lost++;
+			}
 			if(!(data->recieved_message_type[pos] & TYPE_FLAG_INHERT))
 				data->b_frame_count++;
 			break;
@@ -332,6 +350,12 @@ static void init_rtp_data(struct rtp_connect_data *data, u_int32_t ssrc, time_t 
 	data->i_frame_count = 0;
 	data->p_frame_count = 0;
 	data->b_frame_count = 0;
+	data->i_frame_packet_count = 0;
+	data->p_frame_packet_count = 0;
+	data->b_frame_packet_count = 0;
+	data->i_frame_packet_lost = 0;
+	data->p_frame_packet_lost = 0;
+	data->b_frame_packet_lost = 0;
 	data->total_bytes = 0;
 	data->i_frame_bytes = 0;
 	data->p_frame_bytes = 0;
@@ -522,9 +546,13 @@ static void output_data(FILE *f, struct rtp_connect_data *value)
 	p += sprintf(p, "    Packets: %d/%d ", pall - value->packet_lost, pall);
 	p += sprintf(p, "Total Bytes: %" PRIu64 " bytes ", value->total_bytes);
 	p += sprintf(p, "Non-Frame Bytes: %" PRIu64 " bytes\n", value->other_bytes);
-	p += sprintf(p, "    Frames: I:%d(%" PRIu64 " bytes) ", value->i_frame_count, value->i_frame_bytes);
-	p += sprintf(p, "P:%d(%" PRIu64 " bytes) ", value->p_frame_count, value->p_frame_bytes);
-	p += sprintf(p, "B:%d(%" PRIu64 " bytes)\n\n", value->b_frame_count, value->b_frame_bytes);
+	p += sprintf(p, "    Frames:\n");
+	p += sprintf(p, "        I(%d/%d):%d(%" PRIu64 " bytes), lose rate:%.2f%%\n", value->i_frame_packet_count-value->i_frame_packet_lost,
+		value->i_frame_packet_count, value->i_frame_count, value->i_frame_bytes, (float)value->i_frame_packet_lost/value->i_frame_packet_count*100);
+	p += sprintf(p, "        P(%d/%d):%d(%" PRIu64 " bytes), lose rate:%.2f%%\n", value->p_frame_packet_count-value->p_frame_packet_lost,
+		value->p_frame_packet_count, value->p_frame_count, value->p_frame_bytes, (float)value->b_frame_packet_lost/value->b_frame_packet_count*100);
+	p += sprintf(p, "        B(%d/%d):%d(%" PRIu64 " bytes), lose rate:%.2f%%\n\n", value->b_frame_packet_count-value->b_frame_packet_lost,
+		value->b_frame_packet_count, value->b_frame_count, value->b_frame_bytes, (float)value->p_frame_packet_lost/value->p_frame_packet_count*100);
 
 	if(verbose && f != stdout) {
 		fwrite(buffer, 1, p-buffer, stdout);
