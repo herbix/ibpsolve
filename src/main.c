@@ -550,9 +550,9 @@ static void output_data(FILE *f, struct rtp_connect_data *value)
 	p += sprintf(p, "        I(%d/%d):%d(%" PRIu64 " bytes), lose rate:%.2f%%\n", value->i_frame_packet_count-value->i_frame_packet_lost,
 		value->i_frame_packet_count, value->i_frame_count, value->i_frame_bytes, (float)value->i_frame_packet_lost/value->i_frame_packet_count*100);
 	p += sprintf(p, "        P(%d/%d):%d(%" PRIu64 " bytes), lose rate:%.2f%%\n", value->p_frame_packet_count-value->p_frame_packet_lost,
-		value->p_frame_packet_count, value->p_frame_count, value->p_frame_bytes, (float)value->b_frame_packet_lost/value->b_frame_packet_count*100);
+		value->p_frame_packet_count, value->p_frame_count, value->p_frame_bytes, (float)value->p_frame_packet_lost/value->p_frame_packet_count*100);
 	p += sprintf(p, "        B(%d/%d):%d(%" PRIu64 " bytes), lose rate:%.2f%%\n\n", value->b_frame_packet_count-value->b_frame_packet_lost,
-		value->b_frame_packet_count, value->b_frame_count, value->b_frame_bytes, (float)value->p_frame_packet_lost/value->p_frame_packet_count*100);
+		value->b_frame_packet_count, value->b_frame_count, value->b_frame_bytes, (float)value->b_frame_packet_lost/value->b_frame_packet_count*100);
 
 	if(verbose && f != stdout) {
 		fwrite(buffer, 1, p-buffer, stdout);
