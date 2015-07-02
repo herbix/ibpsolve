@@ -414,6 +414,12 @@ static void parse_rtp_message(const struct ip_port_pair *pair,
 			int pos = seq % RECIEVED_MESSAGE_COUNT;
 			add_up_data_at_pos(data, pos);
 
+			// The packet has stored frame type information
+			if(iph->tos & 1) {
+				data->recieved_message_type[pos] = (iph->tos >> 1) & 0x7;
+				if(data->recieved_message_type[pos] == 7)
+					data->recieved_message_type[pos] = TYPE_SLICE_UNKNOWN;
+			} else
 			// If E flag of last message type is set, this message type
 			// should be UNKNOWN without EI flags. Otherwise this message
 			// copies last message type and sets I flag.
